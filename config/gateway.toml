@@ -1,0 +1,47 @@
+[server]
+bind_address = "0.0.0.0"
+http_port = 8080
+
+[logging]
+level = "info"
+format = "pretty"
+
+[[routes]]
+id = "api-service-items"
+path_prefix = "/api/v1/items"
+upstream = "http://127.0.0.1:9001"
+strip_prefix = false
+methods = ["GET", "POST", "PUT", "DELETE"]
+timeout_ms = 10000
+
+[[routes]]
+id = "api-service-ws"
+path_prefix = "/ws"
+upstream = "http://127.0.0.1:9001"
+strip_prefix = false
+methods = ["GET"]
+timeout_ms = 30000
+
+[[routes]]
+id = "test-service-echo"
+path_prefix = "/test/echo"
+upstream = "http://127.0.0.1:9002"
+strip_prefix = false
+methods = ["GET", "POST", "PUT", "DELETE"]
+timeout_ms = 5000
+
+[[routes]]
+id = "test-service-health"
+path_prefix = "/test/health"
+upstream = "http://127.0.0.1:9002"
+strip_prefix = false
+methods = ["GET"]
+timeout_ms = 5000
+
+[[routes]]
+id = "test-service-headers"
+path_prefix = "/test/headers"
+upstream = "http://127.0.0.1:9002"
+strip_prefix = false
+methods = ["GET"]
+timeout_ms = 5000

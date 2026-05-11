@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pqc-gateway",
+    "crates/pqc-proxy",
+    "crates/sample-api-service",
+    "crates/sample-test-service",
+    "crates/sample-client",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "timeout", "request-id", "util", "cors", "compression-gzip"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
