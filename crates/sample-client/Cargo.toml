@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+pqc-tls = { path = "../pqc-tls" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -13,3 +14,4 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+rustls = { version = "0.23", default-features = false }

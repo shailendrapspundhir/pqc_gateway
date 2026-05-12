@@ -83,18 +83,18 @@ wait_for_port 9001 "sample-api-service"
 wait_for_port 9002 "sample-test-service"
 
 # Start gateway (port 8080)
-echo -e "${YELLOW}Starting pqc-gateway on :8080...${NC}"
+echo -e "${YELLOW}Starting pqc-gateway on :8090...${NC}"
 cargo run --bin pqc-gateway -- --config config/gateway.toml &>/dev/null &
 PIDS+=($!)
 
-wait_for_port 8080 "pqc-gateway"
+wait_for_port 8090 "pqc-gateway"
 echo ""
 
 # ------------------------------------------------------------------
 # Tests
 # ------------------------------------------------------------------
 
-GATEWAY="http://127.0.0.1:8080"
+GATEWAY="http://127.0.0.1:8090"
 
 echo "--- Test 1: Gateway health check ---"
 RESP=$(curl -s -o /dev/null -w "%{http_code}" "$GATEWAY/health")
@@ -249,7 +249,37 @@ else
     fail "Query string lost: $RESP"
 fi
 
-echo "--- Test 17: WebSocket echo (direct to upstream) ---"
+echo "--- Test 17: TLS certificate generation ---"
+rm -rf /tmp/pqc_run_test_certs
+cargo run --bin pqc-certgen -- generate \
+    --output /tmp/pqc_run_test_certs \
+    --algorithm ecdsa-p256 \
+    --cn localhost \
+    --san-dns localhost \
+    --san-ips "127.0.0.1,::1" 2>/dev/null
+if [ -f /tmp/pqc_run_test_certs/ca.crt ] && [ -f /tmp/pqc_run_test_certs/server.crt ]; then
+    pass "ECDSA certificate generation works"
+else
+    fail "Certificate generation failed"
+fi
+
+echo "--- Test 18: FIPS compliance self-tests ---"
+FIPS_OUT=$(cargo run --bin pqc-certgen -- fips-check 2>/dev/null)
+if echo "$FIPS_OUT" | grep -q "ALL CHECKS PASSED"; then
+    pass "FIPS compliance checks passed (FIPS 140-3, 186-5, 203, 204)"
+else
+    fail "FIPS compliance checks failed"
+fi
+
+echo "--- Test 19: PQC algorithms operational ---"
+PQC_OUT=$(cargo run --bin pqc-certgen -- pqc-demo 2>/dev/null)
+if echo "$PQC_OUT" | grep -q "Verified:.*true" && echo "$PQC_OUT" | grep -q "Secrets match:.*true"; then
+    pass "ML-DSA-65 signing + ML-KEM-768 encapsulation operational"
+else
+    fail "PQC algorithm tests failed"
+fi
+
+echo "--- Test 20: WebSocket echo (direct to upstream) ---"
 # Test WebSocket with a short timeout using a simple approach
 if command -v websocat &>/dev/null; then
     WS_RESP=$(echo "hello ws" | timeout 3 websocat ws://127.0.0.1:9001/ws/echo 2>/dev/null || true)

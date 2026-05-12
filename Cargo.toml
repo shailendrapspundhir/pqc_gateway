@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/pqc-gateway",
     "crates/pqc-proxy",
+    "crates/pqc-tls",
+    "crates/pqc-certgen",
     "crates/sample-api-service",
     "crates/sample-test-service",
     "crates/sample-client",

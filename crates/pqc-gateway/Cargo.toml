@@ -5,11 +5,13 @@ edition = "2021"
 
 [dependencies]
 pqc-proxy = { path = "../pqc-proxy" }
+pqc-tls = { path = "../pqc-tls" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 hyper = { workspace = true }
+hyper-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
@@ -18,3 +20,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false }
+rustls-pemfile = "2"

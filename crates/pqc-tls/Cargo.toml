@@ -1,0 +1,29 @@
+[package]
+name = "pqc-tls"
+version = "0.1.0"
+edition = "2021"
+description = "TLS 1.3 + Post-Quantum Cryptography library for PQC Gateway"
+
+[dependencies]
+# TLS stack (pure Rust, no OpenSSL)
+rustls = { version = "0.23", features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+
+# PQC primitives (pure Rust, FIPS 203/204)
+ml-kem = { version = "0.3", features = ["getrandom"] }
+ml-dsa = { version = "0.1.0-rc.11", features = ["getrandom"] }
+
+# Certificate generation
+rcgen = { version = "0.13", features = ["aws_lc_rs"] }
+time = "0.3"
+
+# Shared dependencies
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+
+sha2 = "0.10"

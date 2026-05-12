@@ -5,6 +5,8 @@ use std::path::Path;
 pub struct GatewayConfig {
     pub server: ServerConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub tls: TlsFileConfig,
     #[serde(default, rename = "routes")]
     pub routes: Vec<RouteConfig>,
 }
@@ -13,6 +15,44 @@ pub struct GatewayConfig {
 pub struct ServerConfig {
     pub bind_address: String,
     pub http_port: u16,
+}
+
+/// TLS configuration section from gateway.toml (file-level representation).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsFileConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_cert_file")]
+    pub cert_file: String,
+    #[serde(default = "default_key_file")]
+    pub key_file: String,
+    #[serde(default = "default_min_version")]
+    pub min_version: String,
+    #[serde(default = "default_pqc_enabled")]
+    pub pqc_enabled: bool,
+    #[serde(default = "default_https_port")]
+    pub https_port: u16,
+    pub ca_file: Option<String>,
+}
+
+fn default_cert_file() -> String { "config/certs/server.crt".to_string() }
+fn default_key_file() -> String { "config/certs/server.key".to_string() }
+fn default_min_version() -> String { "1.3".to_string() }
+fn default_pqc_enabled() -> bool { true }
+fn default_https_port() -> u16 { 8443 }
+
+impl Default for TlsFileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_file: default_cert_file(),
+            key_file: default_key_file(),
+            min_version: default_min_version(),
+            pqc_enabled: default_pqc_enabled(),
+            https_port: default_https_port(),
+            ca_file: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

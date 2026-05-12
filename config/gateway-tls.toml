@@ -7,7 +7,7 @@ level = "info"
 format = "pretty"
 
 [tls]
-enabled = false
+enabled = true
 cert_file = "config/certs/server.crt"
 key_file = "config/certs/server.key"
 min_version = "1.3"
