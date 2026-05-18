@@ -9,3 +9,4 @@ pub mod certgen;
 pub mod config;
 pub mod fips;
 pub mod provider;
+pub mod signature;

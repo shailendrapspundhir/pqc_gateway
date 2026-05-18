@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use crate::signature::SignatureMode;
+
 /// TLS configuration section from gateway.toml.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsConfig {
@@ -22,6 +24,25 @@ pub struct TlsConfig {
     pub https_port: u16,
     /// Optional CA certificate for client verification.
     pub ca_file: Option<String>,
+    /// Signature configuration (optional, defaults to classical).
+    #[serde(default)]
+    pub signatures: SignatureConfig,
+}
+
+/// Signature configuration section.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignatureConfig {
+    /// Default signature mode for all routes unless overridden.
+    #[serde(default)]
+    pub default_mode: SignatureMode,
+}
+
+impl Default for SignatureConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: SignatureMode::Classical,
+        }
+    }
 }
 
 fn default_cert_file() -> String {
@@ -54,6 +75,7 @@ impl Default for TlsConfig {
             pqc_enabled: default_pqc_enabled(),
             https_port: default_https_port(),
             ca_file: None,
+            signatures: SignatureConfig::default(),
         }
     }
 }

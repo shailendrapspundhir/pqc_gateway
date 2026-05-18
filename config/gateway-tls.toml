@@ -15,6 +15,12 @@ pqc_enabled = true
 https_port = 8443
 # ca_file = "config/certs/ca.crt"  # Uncomment for mutual TLS
 
+# Signature configuration: "classical" | "hybrid" | "mldsa-only"
+# Can be overridden globally by PQC_SIGNATURE_MODE env var,
+# or per-route via signature_mode field on each [[routes]] entry.
+[signatures]
+default_mode = "hybrid"
+
 [[routes]]
 id = "api-service-items"
 path_prefix = "/api/v1/items"
@@ -22,6 +28,16 @@ upstream = "http://127.0.0.1:9001"
 strip_prefix = false
 methods = ["GET", "POST", "PUT", "DELETE"]
 timeout_ms = 10000
+signature_mode = "hybrid"
+
+[[routes]]
+id = "api-service-secure"
+path_prefix = "/api/v1/secure"
+upstream = "http://127.0.0.1:9001"
+strip_prefix = false
+methods = ["GET", "POST", "DELETE"]
+timeout_ms = 5000
+signature_mode = "mldsa-only"
 
 [[routes]]
 id = "api-service-ws"

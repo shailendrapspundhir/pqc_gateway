@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+pqc-tls = { path = "../pqc-tls" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
@@ -17,3 +18,4 @@ toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
+sha2 = "0.10"

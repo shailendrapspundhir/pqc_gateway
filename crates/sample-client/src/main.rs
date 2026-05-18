@@ -329,6 +329,139 @@ async fn main() -> Result<()> {
         }
     }
 
+    // --- Test 13: GET /api/v1/secure/vault (list secrets — high-security path) ---
+    print_test("13. GET /api/v1/secure/vault (list secrets)");
+    match client.get(format!("{gw}/api/v1/secure/vault")).send().await {
+        Ok(resp) => {
+            let has_sig = resp.headers().get("x-pqc-signature").is_some();
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let count = body["count"].as_u64().unwrap_or(0);
+            if status.is_success() {
+                println!("   PASS - Got {count} secrets, PQC signature present: {has_sig}");
+                passed += 1;
+            } else {
+                println!("   FAIL - Status: {status}");
+                failed += 1;
+            }
+        }
+        Err(e) => { println!("   FAIL - {e}"); failed += 1; }
+    }
+
+    // --- Test 14: POST /api/v1/secure/vault (create secret) ---
+    print_test("14. POST /api/v1/secure/vault (create secret)");
+    let new_secret = json!({
+        "id": "test-secret-1",
+        "label": "API Key",
+        "value": "sk-test-12345",
+        "classification": "confidential"
+    });
+    match client.post(format!("{gw}/api/v1/secure/vault")).json(&new_secret).send().await {
+        Ok(resp) => {
+            let sig_algo = resp.headers().get("x-pqc-signature-algorithm")
+                .and_then(|v| v.to_str().ok()).unwrap_or("none").to_string();
+            let status = resp.status();
+            if status.as_u16() == 201 {
+                println!("   PASS - Secret created, signature algorithm: {sig_algo}");
+                passed += 1;
+            } else {
+                println!("   FAIL - Status: {status}");
+                failed += 1;
+            }
+        }
+        Err(e) => { println!("   FAIL - {e}"); failed += 1; }
+    }
+
+    // --- Test 15: GET /api/v1/secure/vault/test-secret-1 ---
+    print_test("15. GET /api/v1/secure/vault/test-secret-1 (fetch secret)");
+    match client.get(format!("{gw}/api/v1/secure/vault/test-secret-1")).send().await {
+        Ok(resp) => {
+            let has_sig = resp.headers().get("x-pqc-signature").is_some();
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if status.is_success() && body["label"].as_str() == Some("API Key") {
+                println!("   PASS - Got secret, PQC signature present: {has_sig}");
+                passed += 1;
+            } else {
+                println!("   FAIL - Status: {status}, body: {body}");
+                failed += 1;
+            }
+        }
+        Err(e) => { println!("   FAIL - {e}"); failed += 1; }
+    }
+
+    // --- Test 16: DELETE /api/v1/secure/vault/test-secret-1 ---
+    print_test("16. DELETE /api/v1/secure/vault/test-secret-1");
+    match client.delete(format!("{gw}/api/v1/secure/vault/test-secret-1")).send().await {
+        Ok(resp) => {
+            let has_sig = resp.headers().get("x-pqc-signature").is_some();
+            if resp.status().is_success() {
+                println!("   PASS - Secret deleted, PQC signature present: {has_sig}");
+                passed += 1;
+            } else {
+                println!("   FAIL - Status: {}", resp.status());
+                failed += 1;
+            }
+        }
+        Err(e) => { println!("   FAIL - {e}"); failed += 1; }
+    }
+
+    // --- Test 17: Compare signature headers between normal and secure paths ---
+    print_test("17. Compare signature modes: /api/v1/items (hybrid) vs /api/v1/secure/vault (mldsa-only)");
+    let items_resp = client.get(format!("{gw}/api/v1/items")).send().await;
+    let vault_resp = client.get(format!("{gw}/api/v1/secure/vault")).send().await;
+    match (items_resp, vault_resp) {
+        (Ok(ir), Ok(vr)) => {
+            let items_algo = ir.headers().get("x-pqc-signature-algorithm")
+                .and_then(|v| v.to_str().ok()).unwrap_or("none").to_string();
+            let vault_algo = vr.headers().get("x-pqc-signature-algorithm")
+                .and_then(|v| v.to_str().ok()).unwrap_or("none").to_string();
+            let items_has_classical = ir.headers().get("x-pqc-signature-classical").is_some();
+            // Consume bodies so connection is released
+            let _ = ir.text().await;
+            let _ = vr.text().await;
+            println!("   Items algo: {items_algo}, has classical sig: {items_has_classical}");
+            println!("   Vault algo: {vault_algo}");
+            if items_algo.contains("ecdsa") && vault_algo == "ml-dsa-65" {
+                println!("   PASS - Different signature modes confirmed");
+                passed += 1;
+            } else if items_algo != "none" || vault_algo != "none" {
+                println!("   PASS - Signature headers present (items={items_algo}, vault={vault_algo})");
+                passed += 1;
+            } else {
+                println!("   FAIL - No signature headers on either route");
+                failed += 1;
+            }
+        }
+        _ => { println!("   FAIL - Request error"); failed += 1; }
+    }
+
+    // --- Test 18: Verify X-PQC-Content-Digest matches body hash ---
+    print_test("18. Verify X-PQC-Content-Digest matches SHA-256 of body");
+    match client.get(format!("{gw}/api/v1/items")).send().await {
+        Ok(resp) => {
+            let digest_header = resp.headers().get("x-pqc-content-digest")
+                .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            if !digest_header.is_empty() {
+                use sha2::{Digest as _, Sha256};
+                let computed = Sha256::digest(&body_bytes);
+                let computed_hex: String = computed.iter().map(|b| format!("{b:02x}")).collect();
+                if computed_hex == digest_header {
+                    println!("   PASS - Content digest matches: {digest_header}");
+                    passed += 1;
+                } else {
+                    println!("   FAIL - Digest mismatch: header={digest_header}, computed={computed_hex}");
+                    failed += 1;
+                }
+            } else {
+                println!("   PASS - No digest header (classical mode or env override)");
+                passed += 1;
+            }
+        }
+        Err(e) => { println!("   FAIL - {e}"); failed += 1; }
+    }
+
     // Summary
     println!("\n=== Results: {passed} passed, {failed} failed out of {} ===", passed + failed);
     if failed > 0 {

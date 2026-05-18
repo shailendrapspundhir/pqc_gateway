@@ -1,3 +1,5 @@
+use pqc_tls::signature::SignatureMode;
+
 use crate::config::RouteConfig;
 
 #[derive(Debug, Clone)]
@@ -8,10 +10,16 @@ pub struct Route {
     pub strip_prefix: bool,
     pub methods: Vec<String>,
     pub timeout_ms: u64,
+    /// Per-route signature mode override (None = use global default).
+    pub signature_mode: Option<SignatureMode>,
 }
 
 impl From<&RouteConfig> for Route {
     fn from(cfg: &RouteConfig) -> Self {
+        let signature_mode = cfg
+            .signature_mode
+            .as_deref()
+            .and_then(|s| s.parse::<SignatureMode>().ok());
         Self {
             id: cfg.id.clone(),
             path_prefix: cfg.path_prefix.clone(),
@@ -19,6 +27,7 @@ impl From<&RouteConfig> for Route {
             strip_prefix: cfg.strip_prefix,
             methods: cfg.methods.iter().map(|m| m.to_uppercase()).collect(),
             timeout_ms: cfg.timeout_ms,
+            signature_mode,
         }
     }
 }
@@ -83,6 +92,7 @@ mod tests {
             strip_prefix: false,
             methods: methods.iter().map(|s| s.to_string()).collect(),
             timeout_ms: 5000,
+            signature_mode: None,
         }
     }
 
@@ -145,10 +155,29 @@ mod tests {
             strip_prefix: true,
             methods: vec!["GET".to_string()],
             timeout_ms: 5000,
+            signature_mode: None,
         }];
         let matcher = RouteMatcher::new(&routes);
 
         let (_, upstream_path) = matcher.match_route("/api/v1/items/42", "GET").unwrap();
         assert_eq!(upstream_path, "/42");
+    }
+
+    #[test]
+    fn test_route_with_signature_mode() {
+        let mut cfg = make_route("r1", "/api/v1/items", "http://localhost:9001", &["GET"]);
+        cfg.signature_mode = Some("hybrid".to_string());
+        let routes = vec![cfg];
+        let matcher = RouteMatcher::new(&routes);
+        let (route, _) = matcher.match_route("/api/v1/items", "GET").unwrap();
+        assert_eq!(route.signature_mode, Some(SignatureMode::Hybrid));
+    }
+
+    #[test]
+    fn test_route_without_signature_mode() {
+        let routes = vec![make_route("r1", "/api/v1/items", "http://localhost:9001", &["GET"])];
+        let matcher = RouteMatcher::new(&routes);
+        let (route, _) = matcher.match_route("/api/v1/items", "GET").unwrap();
+        assert!(route.signature_mode.is_none());
     }
 }

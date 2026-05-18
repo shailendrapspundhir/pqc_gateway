@@ -7,8 +7,30 @@ pub struct GatewayConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub tls: TlsFileConfig,
+    #[serde(default)]
+    pub signatures: SignaturesConfig,
     #[serde(default, rename = "routes")]
     pub routes: Vec<RouteConfig>,
+}
+
+/// Global signature configuration section `[signatures]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignaturesConfig {
+    /// Default signature mode for all routes: "classical" | "hybrid" | "mldsa-only"
+    #[serde(default = "default_signature_mode")]
+    pub default_mode: String,
+}
+
+fn default_signature_mode() -> String {
+    "classical".to_string()
+}
+
+impl Default for SignaturesConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: default_signature_mode(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +104,8 @@ pub struct RouteConfig {
     pub methods: Vec<String>,
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
+    /// Per-route signature mode override: "classical" | "hybrid" | "mldsa-only"
+    pub signature_mode: Option<String>,
 }
 
 fn default_timeout() -> u64 {

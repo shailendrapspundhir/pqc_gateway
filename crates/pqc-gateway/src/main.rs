@@ -34,9 +34,13 @@ async fn main() -> Result<()> {
     // Initialize tracing
     init_tracing(&config.logging.level, &config.logging.format);
 
+    // Log signature mode from env and config
+    let env_sig_mode = std::env::var("PQC_SIGNATURE_MODE").ok();
     info!(
         version = env!("CARGO_PKG_VERSION"),
         config = %cli.config.display(),
+        env_signature_mode = ?env_sig_mode,
+        config_default_signature_mode = %config.signatures.default_mode,
         "Starting PQC Gateway"
     );
 
@@ -74,6 +78,7 @@ async fn start_with_tls(
         pqc_enabled: tls_file_config.pqc_enabled,
         https_port: tls_file_config.https_port,
         ca_file: tls_file_config.ca_file.clone(),
+        signatures: Default::default(),
     };
 
     // Run FIPS compliance checks at startup

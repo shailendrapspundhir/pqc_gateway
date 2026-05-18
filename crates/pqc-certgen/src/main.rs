@@ -70,6 +70,9 @@ enum Commands {
 
     /// Run FIPS compliance checks and print report.
     FipsCheck,
+
+    /// Demonstrate PQC signature modes (hybrid + ML-DSA-only).
+    SignatureDemo,
 }
 
 fn main() -> Result<()> {
@@ -168,6 +171,10 @@ fn main() -> Result<()> {
         Commands::FipsCheck => {
             run_fips_check();
         }
+
+        Commands::SignatureDemo => {
+            run_signature_demo()?;
+        }
     }
 
     Ok(())
@@ -235,6 +242,62 @@ fn run_fips_check() {
         println!("Result: SOME CHECKS FAILED");
         std::process::exit(1);
     }
+}
+
+fn run_signature_demo() -> Result<()> {
+    use pqc_tls::signature::{SignatureKeyManager, SignatureMode};
+
+    println!("=== PQC Signature Demo ===\n");
+
+    let km = SignatureKeyManager::generate();
+    println!("Key Manager Fingerprint: {}", km.fingerprint());
+    println!("  ECDSA-P256 public key: {} bytes", km.ecdsa_verifying_key_bytes().len());
+    println!("  ML-DSA-65 public key:  {} bytes\n", km.mldsa_public_key().len());
+
+    let sample_data = br#"{"message":"Hello from PQC Gateway","timestamp":"2025-01-01T00:00:00Z"}"#;
+    println!("Sample data ({} bytes):", sample_data.len());
+    println!("  {}\n", String::from_utf8_lossy(sample_data));
+
+    // Hybrid mode
+    println!("--- Hybrid Mode (ECDSA-P256 + ML-DSA-65) ---");
+    if let Some(output) = km.sign(SignatureMode::Hybrid, sample_data) {
+        println!("  Algorithm:         {}", output.algorithm);
+        println!("  PQC signature:     {} chars (base64)", output.pqc_signature.len());
+        println!("  Classical sig:     {} chars (base64)",
+            output.classical_signature.as_ref().map(|s| s.len()).unwrap_or(0));
+        println!("  Content digest:    {}", output.content_digest);
+        println!("  Fingerprint:       {}", output.public_key_fingerprint);
+        let valid = km.verify(sample_data, &output);
+        println!("  Verification:      {}", if valid { "PASS" } else { "FAIL" });
+        // Tamper test
+        let tampered = b"tampered data";
+        let tamper_valid = km.verify(tampered, &output);
+        println!("  Tamper detection:  {} (should be false)\n", tamper_valid);
+    }
+
+    // ML-DSA only mode
+    println!("--- ML-DSA-65 Only Mode ---");
+    if let Some(output) = km.sign(SignatureMode::MlDsaOnly, sample_data) {
+        println!("  Algorithm:         {}", output.algorithm);
+        println!("  PQC signature:     {} chars (base64)", output.pqc_signature.len());
+        println!("  Classical sig:     {}", if output.classical_signature.is_some() { "present" } else { "none (correct)" });
+        println!("  Content digest:    {}", output.content_digest);
+        println!("  Fingerprint:       {}", output.public_key_fingerprint);
+        let valid = km.verify(sample_data, &output);
+        println!("  Verification:      {}", if valid { "PASS" } else { "FAIL" });
+        let tampered = b"tampered data";
+        let tamper_valid = km.verify(tampered, &output);
+        println!("  Tamper detection:  {} (should be false)\n", tamper_valid);
+    }
+
+    // Classical mode
+    println!("--- Classical Mode ---");
+    let output = km.sign(SignatureMode::Classical, sample_data);
+    println!("  Signature output:  {} (correct — no PQC signature in classical mode)\n",
+        if output.is_none() { "None" } else { "Some (unexpected)" });
+
+    println!("=== Signature demo complete ===");
+    Ok(())
 }
 
 fn parse_algorithm(s: &str) -> Result<CertAlgorithm> {

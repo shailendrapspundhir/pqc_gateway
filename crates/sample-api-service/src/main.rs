@@ -18,17 +18,32 @@ struct Item {
     description: String,
 }
 
-type ItemStore = Arc<RwLock<HashMap<String, Item>>>;
+/// A secret stored in the high-security vault.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Secret {
+    id: String,
+    label: String,
+    value: String,
+    classification: String,
+}
+
+/// Shared state holding both item and vault stores.
+#[derive(Clone)]
+struct AppState {
+    items: Arc<RwLock<HashMap<String, Item>>>,
+    vault: Arc<RwLock<HashMap<String, Secret>>>,
+}
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().init();
 
-    let store: ItemStore = Arc::new(RwLock::new(HashMap::new()));
+    let items: Arc<RwLock<HashMap<String, Item>>> = Arc::new(RwLock::new(HashMap::new()));
+    let vault: Arc<RwLock<HashMap<String, Secret>>> = Arc::new(RwLock::new(HashMap::new()));
 
-    // Seed some data
+    // Seed item data
     {
-        let mut s = store.write().await;
+        let mut s = items.write().await;
         s.insert(
             "1".to_string(),
             Item {
@@ -47,14 +62,37 @@ async fn main() {
         );
     }
 
+    // Seed vault data
+    {
+        let mut v = vault.write().await;
+        v.insert(
+            "secret-1".to_string(),
+            Secret {
+                id: "secret-1".to_string(),
+                label: "DB Password".to_string(),
+                value: "s3cret-p@ssw0rd".to_string(),
+                classification: "top-secret".to_string(),
+            },
+        );
+    }
+
+    let state = AppState { items, vault };
+
     let app = Router::new()
+        // Normal items endpoints (hybrid signatures)
         .route("/api/v1/items", get(list_items).post(create_item))
         .route(
             "/api/v1/items/{id}",
             get(get_item).put(update_item).delete(delete_item),
         )
+        // High-security vault endpoints (mldsa-only signatures)
+        .route("/api/v1/secure/vault", get(list_secrets).post(create_secret))
+        .route(
+            "/api/v1/secure/vault/{id}",
+            get(get_secret).delete(delete_secret),
+        )
         .route("/ws/echo", get(ws_handler))
-        .with_state(store);
+        .with_state(state);
 
     let listener = TcpListener::bind("0.0.0.0:9001").await.unwrap();
     info!("Sample API service listening on 0.0.0.0:9001");
@@ -62,17 +100,19 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn list_items(State(store): State<ItemStore>) -> Json<serde_json::Value> {
-    let s = store.read().await;
+// ---- Item CRUD (normal path — hybrid signatures) ----
+
+async fn list_items(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let s = state.items.read().await;
     let items: Vec<&Item> = s.values().collect();
     Json(serde_json::json!({ "items": items, "count": items.len() }))
 }
 
 async fn get_item(
-    State(store): State<ItemStore>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let s = store.read().await;
+    let s = state.items.read().await;
     match s.get(&id) {
         Some(item) => Ok(Json(serde_json::json!(item))),
         None => Err(axum::http::StatusCode::NOT_FOUND),
@@ -80,10 +120,10 @@ async fn get_item(
 }
 
 async fn create_item(
-    State(store): State<ItemStore>,
+    State(state): State<AppState>,
     Json(item): Json<Item>,
 ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    let mut s = store.write().await;
+    let mut s = state.items.write().await;
     let id = if item.id.is_empty() {
         uuid::Uuid::new_v4().to_string()
     } else {
@@ -103,11 +143,11 @@ async fn create_item(
 }
 
 async fn update_item(
-    State(store): State<ItemStore>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(update): Json<Item>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let mut s = store.write().await;
+    let mut s = state.items.write().await;
     if !s.contains_key(&id) {
         return Err(axum::http::StatusCode::NOT_FOUND);
     }
@@ -122,14 +162,71 @@ async fn update_item(
 }
 
 async fn delete_item(
-    State(store): State<ItemStore>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
-    let mut s = store.write().await;
+    let mut s = state.items.write().await;
     match s.remove(&id) {
         Some(item) => {
             info!(id = %id, "Item deleted");
             Ok(Json(serde_json::json!({ "deleted": item })))
+        }
+        None => Err(axum::http::StatusCode::NOT_FOUND),
+    }
+}
+
+// ---- Secure Vault CRUD (high-security path — mldsa-only signatures) ----
+
+async fn list_secrets(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let v = state.vault.read().await;
+    let secrets: Vec<&Secret> = v.values().collect();
+    Json(serde_json::json!({ "secrets": secrets, "count": secrets.len() }))
+}
+
+async fn get_secret(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    let v = state.vault.read().await;
+    match v.get(&id) {
+        Some(secret) => Ok(Json(serde_json::json!(secret))),
+        None => Err(axum::http::StatusCode::NOT_FOUND),
+    }
+}
+
+async fn create_secret(
+    State(state): State<AppState>,
+    Json(secret): Json<Secret>,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let mut v = state.vault.write().await;
+    let id = if secret.id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        secret.id.clone()
+    };
+    let new_secret = Secret {
+        id: id.clone(),
+        label: secret.label,
+        value: secret.value,
+        classification: secret.classification,
+    };
+    v.insert(id.clone(), new_secret.clone());
+    info!(id = %id, "Secret stored in vault");
+    (
+        axum::http::StatusCode::CREATED,
+        Json(serde_json::json!(new_secret)),
+    )
+}
+
+async fn delete_secret(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    let mut v = state.vault.write().await;
+    match v.remove(&id) {
+        Some(secret) => {
+            info!(id = %id, "Secret deleted from vault");
+            Ok(Json(serde_json::json!({ "deleted": secret })))
         }
         None => Err(axum::http::StatusCode::NOT_FOUND),
     }

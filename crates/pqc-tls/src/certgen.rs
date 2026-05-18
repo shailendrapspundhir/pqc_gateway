@@ -378,5 +378,18 @@ pub mod pqc {
             assert!(!fp.is_empty());
             assert!(fp.contains(':'));
         }
+
+        #[test]
+        fn test_ml_dsa_large_message() {
+            let kp = generate_ml_dsa_keypair();
+            // Simulate a realistic HTTP response body (~4 KB JSON)
+            let large_msg: Vec<u8> = (0..4096).map(|i| (i % 256) as u8).collect();
+            let sig = ml_dsa_sign(&kp.seed, &large_msg).unwrap();
+            assert!(ml_dsa_verify(&kp.public_key, &large_msg, &sig).unwrap());
+            // Tamper with one byte
+            let mut tampered = large_msg.clone();
+            tampered[2048] ^= 0xff;
+            assert!(!ml_dsa_verify(&kp.public_key, &tampered, &sig).unwrap());
+        }
     }
 }

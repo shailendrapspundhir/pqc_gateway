@@ -5,6 +5,7 @@ use http_body_util::BodyExt;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use pqc_tls::signature::{SignatureKeyManager, SignatureMode};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -17,6 +18,10 @@ pub struct ProxyState {
     pub matcher: RouteMatcher,
     pub client: Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
     pub config: Arc<GatewayConfig>,
+    pub signature_key_manager: SignatureKeyManager,
+    pub default_signature_mode: SignatureMode,
+    /// Env-var override (read once at startup).
+    pub env_signature_mode: Option<String>,
 }
 
 impl ProxyState {
@@ -27,9 +32,24 @@ impl ProxyState {
             .pool_max_idle_per_host(32)
             .build_http();
 
+        // Resolve global default signature mode from config
+        let default_signature_mode = config
+            .signatures
+            .default_mode
+            .parse::<SignatureMode>()
+            .unwrap_or(SignatureMode::Classical);
+
+        // Read env override once
+        let env_signature_mode = std::env::var("PQC_SIGNATURE_MODE").ok();
+
+        let signature_key_manager = SignatureKeyManager::generate();
+
         info!(
             route_count = config.routes.len(),
-            "Proxy initialized with routes"
+            default_sig_mode = %default_signature_mode,
+            env_sig_override = ?env_signature_mode,
+            sig_fingerprint = %signature_key_manager.fingerprint(),
+            "Proxy initialized with routes and signature support"
         );
         for route in matcher.routes() {
             info!(
@@ -37,6 +57,7 @@ impl ProxyState {
                 prefix = %route.path_prefix,
                 upstream = %route.upstream,
                 methods = ?route.methods,
+                sig_mode = ?route.signature_mode,
                 "  Route registered"
             );
         }
@@ -45,6 +66,9 @@ impl ProxyState {
             matcher,
             client,
             config: Arc::new(config),
+            signature_key_manager,
+            default_signature_mode,
+            env_signature_mode,
         }
     }
 }
@@ -74,6 +98,13 @@ pub async fn proxy_handler(
     let route_id = route.id.clone();
     let upstream_base = route.upstream.clone();
     let timeout_ms = route.timeout_ms;
+
+    // Resolve effective signature mode for this route
+    let effective_sig_mode = SignatureMode::resolve(
+        state.env_signature_mode.as_deref(),
+        route.signature_mode,
+        state.default_signature_mode,
+    );
 
     // Build upstream URI
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
@@ -120,11 +151,12 @@ pub async fn proxy_handler(
                 request_id = %request_id,
                 route = %route_id,
                 status = %status,
+                sig_mode = %effective_sig_mode,
                 "Upstream response received"
             );
 
             // Convert hyper response to axum response
-            let (parts, body) = response.into_parts();
+            let (mut parts, body) = response.into_parts();
             let body_bytes = match body.collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(e) => {
@@ -132,6 +164,43 @@ pub async fn proxy_handler(
                     return GatewayError::UpstreamConnection(e.to_string()).into_response();
                 }
             };
+
+            // Apply PQC signature if mode is not Classical
+            if let Some(sig_output) = state.signature_key_manager.sign(effective_sig_mode, &body_bytes) {
+                if let Ok(v) = HeaderValue::from_str(&sig_output.algorithm) {
+                    parts.headers.insert(
+                        HeaderName::from_static("x-pqc-signature-algorithm"),
+                        v,
+                    );
+                }
+                if let Ok(v) = HeaderValue::from_str(&sig_output.pqc_signature) {
+                    parts.headers.insert(
+                        HeaderName::from_static("x-pqc-signature"),
+                        v,
+                    );
+                }
+                if let Some(ref classical) = sig_output.classical_signature {
+                    if let Ok(v) = HeaderValue::from_str(classical) {
+                        parts.headers.insert(
+                            HeaderName::from_static("x-pqc-signature-classical"),
+                            v,
+                        );
+                    }
+                }
+                if let Ok(v) = HeaderValue::from_str(&sig_output.content_digest) {
+                    parts.headers.insert(
+                        HeaderName::from_static("x-pqc-content-digest"),
+                        v,
+                    );
+                }
+                if let Ok(v) = HeaderValue::from_str(&sig_output.public_key_fingerprint) {
+                    parts.headers.insert(
+                        HeaderName::from_static("x-pqc-public-key-fingerprint"),
+                        v,
+                    );
+                }
+            }
+
             Response::from_parts(parts, Body::from(body_bytes))
         }
         Ok(Err(e)) => {

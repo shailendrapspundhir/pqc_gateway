@@ -80,6 +80,12 @@ pub fn run_compliance_checks(pqc_enabled: bool) -> Vec<ComplianceCheck> {
     // FIPS 204: ML-DSA validation
     checks.push(validate_ml_dsa());
 
+    // FIPS 204: Hybrid signature (ECDSA + ML-DSA) validation
+    checks.push(validate_hybrid_signature());
+
+    // FIPS 204: ML-DSA-only signature validation
+    checks.push(validate_mldsa_only_signature());
+
     // TLS version check
     checks.push(ComplianceCheck {
         standard: FipsStandard::Fips140_3,
@@ -148,6 +154,68 @@ fn validate_ml_dsa() -> ComplianceCheck {
     }
 }
 
+/// Validate hybrid signature mode (ECDSA-P256 + ML-DSA-65).
+fn validate_hybrid_signature() -> ComplianceCheck {
+    use crate::signature::{SignatureKeyManager, SignatureMode};
+
+    let km = SignatureKeyManager::generate();
+    let test_data = b"FIPS 204 hybrid signature self-test";
+    match km.sign(SignatureMode::Hybrid, test_data) {
+        Some(output) => {
+            let valid = km.verify(test_data, &output);
+            ComplianceCheck {
+                standard: FipsStandard::Fips204,
+                description: "Hybrid signature (ECDSA-P256 + ML-DSA-65) self-test".into(),
+                passed: valid,
+                details: format!(
+                    "Algorithm: {}, PQC sig: {} bytes, Classical sig: {} bytes, valid: {}",
+                    output.algorithm,
+                    output.pqc_signature.len(),
+                    output.classical_signature.as_ref().map(|s| s.len()).unwrap_or(0),
+                    valid,
+                ),
+            }
+        }
+        None => ComplianceCheck {
+            standard: FipsStandard::Fips204,
+            description: "Hybrid signature self-test".into(),
+            passed: false,
+            details: "sign() returned None for Hybrid mode".into(),
+        },
+    }
+}
+
+/// Validate ML-DSA-65-only signature mode.
+fn validate_mldsa_only_signature() -> ComplianceCheck {
+    use crate::signature::{SignatureKeyManager, SignatureMode};
+
+    let km = SignatureKeyManager::generate();
+    let test_data = b"FIPS 204 ML-DSA-only signature self-test";
+    match km.sign(SignatureMode::MlDsaOnly, test_data) {
+        Some(output) => {
+            let valid = km.verify(test_data, &output);
+            ComplianceCheck {
+                standard: FipsStandard::Fips204,
+                description: "ML-DSA-65-only signature self-test".into(),
+                passed: valid && output.classical_signature.is_none(),
+                details: format!(
+                    "Algorithm: {}, PQC sig: {} bytes, no classical sig: {}, valid: {}",
+                    output.algorithm,
+                    output.pqc_signature.len(),
+                    output.classical_signature.is_none(),
+                    valid,
+                ),
+            }
+        }
+        None => ComplianceCheck {
+            standard: FipsStandard::Fips204,
+            description: "ML-DSA-65-only signature self-test".into(),
+            passed: false,
+            details: "sign() returned None for MlDsaOnly mode".into(),
+        },
+    }
+}
+
 /// Print a FIPS compliance report to the log.
 pub fn log_compliance_report(pqc_enabled: bool) {
     let checks = run_compliance_checks(pqc_enabled);
@@ -199,7 +267,7 @@ mod tests {
         // ML-KEM TLS check should fail when PQC is disabled
         let ml_kem_tls = checks
             .iter()
-            .find(|c| c.standard == FipsStandard::Fips203 && c.description.contains("hybrid"))
+            .find(|c| c.standard == FipsStandard::Fips203 && c.description.contains("hybrid key"))
             .unwrap();
         assert!(!ml_kem_tls.passed);
         // But standalone ML-KEM/ML-DSA self-tests should still pass
@@ -208,5 +276,25 @@ mod tests {
             .find(|c| c.standard == FipsStandard::Fips203 && c.description.contains("self-test"))
             .unwrap();
         assert!(ml_kem_self.passed);
+    }
+
+    #[test]
+    fn test_compliance_hybrid_signature() {
+        let checks = run_compliance_checks(true);
+        let hybrid = checks
+            .iter()
+            .find(|c| c.description.contains("Hybrid signature"))
+            .expect("Hybrid signature check should exist");
+        assert!(hybrid.passed, "Hybrid signature check failed: {}", hybrid.details);
+    }
+
+    #[test]
+    fn test_compliance_mldsa_only_signature() {
+        let checks = run_compliance_checks(true);
+        let mldsa = checks
+            .iter()
+            .find(|c| c.description.contains("ML-DSA-65-only signature"))
+            .expect("ML-DSA-only signature check should exist");
+        assert!(mldsa.passed, "ML-DSA-only signature check failed: {}", mldsa.details);
     }
 }
