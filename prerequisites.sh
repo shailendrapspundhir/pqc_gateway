@@ -46,8 +46,8 @@ install_system_deps() {
 
     case "$OS_ID" in
         ubuntu|debian|pop|linuxmint)
-            sudo apt-get update -qq
-            sudo apt-get install -y \
+            apt-get update -qq
+            apt-get install -y \
                 build-essential \
                 gcc \
                 libc6-dev \
@@ -57,7 +57,7 @@ install_system_deps() {
                 git
             ;;
         fedora)
-            sudo dnf install -y \
+            dnf install -y \
                 gcc \
                 glibc-devel \
                 pkg-config \
@@ -66,7 +66,7 @@ install_system_deps() {
                 git
             ;;
         centos|rhel|rocky|almalinux)
-            sudo yum install -y \
+            yum install -y \
                 gcc \
                 glibc-devel \
                 pkgconfig \
@@ -75,7 +75,7 @@ install_system_deps() {
                 git
             ;;
         arch|manjaro)
-            sudo pacman -Sy --noconfirm \
+            pacman -Sy --noconfirm \
                 base-devel \
                 openssl \
                 pkg-config \
@@ -92,14 +92,14 @@ install_system_deps() {
         *)
             # Try debian-style first, then fedora-style
             if command -v apt-get &>/dev/null; then
-                sudo apt-get update -qq
-                sudo apt-get install -y build-essential pkg-config libssl-dev curl git
+                apt-get update -qq
+                apt-get install -y build-essential pkg-config libssl-dev curl git
             elif command -v dnf &>/dev/null; then
-                sudo dnf install -y gcc glibc-devel pkg-config openssl-devel curl git
+                dnf install -y gcc glibc-devel pkg-config openssl-devel curl git
             elif command -v yum &>/dev/null; then
-                sudo yum install -y gcc glibc-devel pkgconfig openssl-devel curl git
+                yum install -y gcc glibc-devel pkgconfig openssl-devel curl git
             elif command -v pacman &>/dev/null; then
-                sudo pacman -Sy --noconfirm base-devel openssl pkg-config curl git
+                pacman -Sy --noconfirm base-devel openssl pkg-config curl git
             else
                 error "Unsupported OS: $OS_ID. Please install manually:"
                 error "  - gcc (C compiler)"

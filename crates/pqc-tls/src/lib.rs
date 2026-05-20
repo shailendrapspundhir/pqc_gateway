@@ -4,9 +4,12 @@
 //! TLS handshakes, with graceful fallback to classical TLS 1.3.
 //! Implements FIPS 203 (ML-KEM) and FIPS 204 (ML-DSA) standards.
 
+pub mod batch_verify;
+pub mod cert_chain;
 pub mod certs;
 pub mod certgen;
 pub mod config;
 pub mod fips;
 pub mod provider;
 pub mod signature;
+pub mod threshold;

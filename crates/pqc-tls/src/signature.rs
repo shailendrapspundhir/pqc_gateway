@@ -264,7 +264,7 @@ impl SignatureKeyManager {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
