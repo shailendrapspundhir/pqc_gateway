@@ -13,3 +13,4 @@ pub mod fips;
 pub mod provider;
 pub mod signature;
 pub mod threshold;
+pub mod versioned_keys;

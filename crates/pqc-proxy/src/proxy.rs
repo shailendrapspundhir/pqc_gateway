@@ -1,17 +1,23 @@
 use axum::body::Body;
 use axum::extract::Request;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use pqc_tls::signature::{SignatureKeyManager, SignatureMode};
+use pqc_tls::versioned_keys::VersionedKeyManager;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, warn};
 
+use crate::body_integrity;
+use crate::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager, CircuitState};
 use crate::config::GatewayConfig;
 use crate::error::GatewayError;
 use crate::router::RouteMatcher;
+use crate::websocket;
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -22,6 +28,10 @@ pub struct ProxyState {
     pub default_signature_mode: SignatureMode,
     /// Env-var override (read once at startup).
     pub env_signature_mode: Option<String>,
+    /// Versioned key manager for JWKS and key rotation.
+    pub versioned_key_manager: VersionedKeyManager,
+    /// Circuit breaker manager for upstream health.
+    pub circuit_breaker: CircuitBreakerManager,
 }
 
 impl ProxyState {
@@ -44,12 +54,43 @@ impl ProxyState {
 
         let signature_key_manager = SignatureKeyManager::generate();
 
+        // Initialize versioned key manager (with optional threshold)
+        let max_retained = config.threshold.max_retained_keys;
+        let versioned_key_manager = if config.threshold.enabled {
+            VersionedKeyManager::with_threshold(
+                max_retained,
+                config.threshold.threshold,
+                config.threshold.total_shares,
+            )
+        } else {
+            VersionedKeyManager::new(max_retained)
+        };
+
+        // Initialize circuit breaker
+        let cb_config = CircuitBreakerConfig {
+            failure_threshold: config.circuit_breaker.failure_threshold,
+            recovery_timeout: Duration::from_millis(config.circuit_breaker.recovery_timeout_ms),
+            health_check_interval: Duration::from_millis(
+                config.circuit_breaker.health_check_interval_ms,
+            ),
+            health_check_path: config.circuit_breaker.health_check_path.clone(),
+        };
+        let circuit_breaker = CircuitBreakerManager::new(cb_config);
+
+        // Register all upstreams with the circuit breaker
+        for route in matcher.routes() {
+            circuit_breaker.register_upstream(&route.upstream, None);
+        }
+
         info!(
             route_count = config.routes.len(),
             default_sig_mode = %default_signature_mode,
             env_sig_override = ?env_signature_mode,
             sig_fingerprint = %signature_key_manager.fingerprint(),
-            "Proxy initialized with routes and signature support"
+            versioned_kid = %versioned_key_manager.current_kid(),
+            cb_enabled = config.circuit_breaker.enabled,
+            threshold_enabled = config.threshold.enabled,
+            "Proxy initialized with routes, signatures, circuit breaker, and versioned keys"
         );
         for route in matcher.routes() {
             info!(
@@ -69,10 +110,31 @@ impl ProxyState {
             signature_key_manager,
             default_signature_mode,
             env_signature_mode,
+            versioned_key_manager,
+            circuit_breaker,
         }
     }
 }
 
+/// WebSocket-capable proxy handler, use with `any()` on WebSocket routes.
+pub async fn ws_proxy_handler(
+    state: axum::extract::State<ProxyState>,
+    ws: WebSocketUpgrade,
+    req: Request,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let method = req.method().as_str();
+
+    if let Some((route, _)) = state.matcher.match_route(&path, method) {
+        let ws_url = websocket::build_upstream_ws_url(route, &path);
+        info!(upstream_ws = %ws_url, "WebSocket upgrade → tunnel");
+        return websocket::ws_upgrade_handler(ws, ws_url).await;
+    }
+
+    GatewayError::NoRouteMatch.into_response()
+}
+
+/// Standard proxy handler for non-WebSocket requests.
 pub async fn proxy_handler(
     state: axum::extract::State<ProxyState>,
     mut req: Request,
@@ -98,6 +160,22 @@ pub async fn proxy_handler(
     let route_id = route.id.clone();
     let upstream_base = route.upstream.clone();
     let timeout_ms = route.timeout_ms;
+
+    // ---- Circuit breaker check ----
+    if state.config.circuit_breaker.enabled {
+        if let Err(CircuitState::Open) = state.circuit_breaker.check_request(&upstream_base) {
+            warn!(
+                request_id = %request_id,
+                route = %route_id,
+                upstream = %upstream_base,
+                "Circuit breaker open — upstream unavailable"
+            );
+            return GatewayError::UpstreamConnection(
+                "circuit breaker open: upstream temporarily unavailable".to_string(),
+            )
+            .into_response();
+        }
+    }
 
     // Resolve effective signature mode for this route
     let effective_sig_mode = SignatureMode::resolve(
@@ -147,6 +225,16 @@ pub async fn proxy_handler(
     match result {
         Ok(Ok(response)) => {
             let status = response.status();
+
+            // Record circuit breaker success/failure based on status
+            if state.config.circuit_breaker.enabled {
+                if status.is_server_error() {
+                    state.circuit_breaker.record_failure(&upstream_base);
+                } else {
+                    state.circuit_breaker.record_success(&upstream_base);
+                }
+            }
+
             info!(
                 request_id = %request_id,
                 route = %route_id,
@@ -201,9 +289,20 @@ pub async fn proxy_handler(
                 }
             }
 
+            // Also sign with versioned key manager (ML-DSA-65 only)
+            body_integrity::sign_response_body(
+                &state.versioned_key_manager,
+                &body_bytes,
+                &mut parts.headers,
+            );
+
             Response::from_parts(parts, Body::from(body_bytes))
         }
         Ok(Err(e)) => {
+            // Record circuit breaker failure
+            if state.config.circuit_breaker.enabled {
+                state.circuit_breaker.record_failure(&upstream_base);
+            }
             error!(
                 request_id = %request_id,
                 route = %route_id,
@@ -213,6 +312,10 @@ pub async fn proxy_handler(
             GatewayError::UpstreamConnection(e.to_string()).into_response()
         }
         Err(_) => {
+            // Record circuit breaker failure on timeout
+            if state.config.circuit_breaker.enabled {
+                state.circuit_breaker.record_failure(&upstream_base);
+            }
             warn!(
                 request_id = %request_id,
                 route = %route_id,

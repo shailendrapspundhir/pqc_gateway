@@ -9,6 +9,12 @@ pub struct GatewayConfig {
     pub tls: TlsFileConfig,
     #[serde(default)]
     pub signatures: SignaturesConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerFileConfig,
+    #[serde(default)]
+    pub threshold: ThresholdConfig,
     #[serde(default, rename = "routes")]
     pub routes: Vec<RouteConfig>,
 }
@@ -29,6 +35,102 @@ impl Default for SignaturesConfig {
     fn default() -> Self {
         Self {
             default_mode: default_signature_mode(),
+        }
+    }
+}
+
+/// Auth configuration section `[auth]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_issuer")]
+    pub issuer: String,
+    #[serde(default = "default_audience")]
+    pub audience: String,
+    #[serde(default = "default_token_ttl")]
+    pub token_ttl_seconds: u64,
+    #[serde(default)]
+    pub public_paths: Vec<String>,
+}
+
+fn default_issuer() -> String { "pqc-gateway".to_string() }
+fn default_audience() -> String { "pqc-gateway-api".to_string() }
+fn default_token_ttl() -> u64 { 3600 }
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: default_issuer(),
+            audience: default_audience(),
+            token_ttl_seconds: default_token_ttl(),
+            public_paths: vec![
+                "/health".to_string(),
+                "/auth/".to_string(),
+                "/.well-known/".to_string(),
+            ],
+        }
+    }
+}
+
+/// Circuit breaker configuration section `[circuit_breaker]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CircuitBreakerFileConfig {
+    #[serde(default = "default_cb_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_recovery_timeout_ms")]
+    pub recovery_timeout_ms: u64,
+    #[serde(default = "default_health_check_interval_ms")]
+    pub health_check_interval_ms: u64,
+    #[serde(default = "default_health_check_path")]
+    pub health_check_path: String,
+}
+
+fn default_cb_enabled() -> bool { true }
+fn default_failure_threshold() -> u32 { 5 }
+fn default_recovery_timeout_ms() -> u64 { 30000 }
+fn default_health_check_interval_ms() -> u64 { 10000 }
+fn default_health_check_path() -> String { "/health".to_string() }
+
+impl Default for CircuitBreakerFileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cb_enabled(),
+            failure_threshold: default_failure_threshold(),
+            recovery_timeout_ms: default_recovery_timeout_ms(),
+            health_check_interval_ms: default_health_check_interval_ms(),
+            health_check_path: default_health_check_path(),
+        }
+    }
+}
+
+/// Threshold key management configuration `[threshold]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThresholdConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_threshold_k")]
+    pub threshold: u8,
+    #[serde(default = "default_threshold_n")]
+    pub total_shares: u8,
+    #[serde(default = "default_max_retained_keys")]
+    pub max_retained_keys: usize,
+}
+
+fn default_threshold_k() -> u8 { 3 }
+fn default_threshold_n() -> u8 { 5 }
+fn default_max_retained_keys() -> usize { 5 }
+
+impl Default for ThresholdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: default_threshold_k(),
+            total_shares: default_threshold_n(),
+            max_retained_keys: default_max_retained_keys(),
         }
     }
 }

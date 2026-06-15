@@ -1,17 +1,20 @@
 use anyhow::Result;
 use axum::middleware;
 use axum::response::Json;
-use axum::routing::get;
+use axum::routing::{any, get, post};
 use axum::Router;
 use clap::Parser;
+use pqc_proxy::circuit_breaker;
 use pqc_proxy::config::GatewayConfig;
+use pqc_proxy::jwt_auth::{self, AuthState};
 use pqc_proxy::middleware::{logging_middleware, request_id_middleware};
-use pqc_proxy::proxy::{proxy_handler, ProxyState};
+use pqc_proxy::proxy::{proxy_handler, ws_proxy_handler, ProxyState};
 use pqc_tls::config::TlsConfig;
 use pqc_tls::fips;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info};
@@ -41,6 +44,9 @@ async fn main() -> Result<()> {
         config = %cli.config.display(),
         env_signature_mode = ?env_sig_mode,
         config_default_signature_mode = %config.signatures.default_mode,
+        auth_enabled = config.auth.enabled,
+        cb_enabled = config.circuit_breaker.enabled,
+        threshold_enabled = config.threshold.enabled,
         "Starting PQC Gateway"
     );
 
@@ -48,14 +54,155 @@ async fn main() -> Result<()> {
     let tls_enabled = config.tls.enabled;
     let tls_file_config = config.tls.clone();
     let http_port = config.server.http_port;
+    let auth_config = config.auth.clone();
+    let cb_enabled = config.circuit_breaker.enabled;
+    let cb_interval_ms = config.circuit_breaker.health_check_interval_ms;
     let state = ProxyState::new(config);
 
-    let app = Router::new()
+    // Set up auth state
+    let auth_state = Arc::new(AuthState {
+        key_manager: state.versioned_key_manager.clone(),
+        issuer: auth_config.issuer.clone(),
+        audience: auth_config.audience.clone(),
+        public_paths: auth_config.public_paths.clone(),
+    });
+
+    // Clone for handlers
+    let versioned_km = state.versioned_key_manager.clone();
+    let cb_manager = state.circuit_breaker.clone();
+    let auth_state_for_token = auth_state.clone();
+
+    let mut app = Router::new()
         .route("/health", get(health_handler))
+        .route(
+            "/.well-known/jwks.json",
+            get({
+                let km = versioned_km.clone();
+                move || async move { Json(km.jwks()) }
+            }),
+        )
+        .route(
+            "/auth/token",
+            post({
+                let auth = auth_state_for_token.clone();
+                move |body: Json<serde_json::Value>| async move {
+                    let sub = body.get("sub").and_then(|v| v.as_str()).unwrap_or("anonymous");
+                    let roles: Vec<String> = body
+                        .get("roles")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    match jwt_auth::create_jwt(
+                        &auth.key_manager,
+                        sub,
+                        &roles,
+                        &auth.issuer,
+                        &auth.audience,
+                        3600,
+                    ) {
+                        Some(token) => Json(json!({
+                            "token": token,
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                            "algorithm": "ML-DSA-65",
+                            "kid": auth.key_manager.current_kid(),
+                        })),
+                        None => Json(json!({ "error": "token generation failed" })),
+                    }
+                }
+            }),
+        )
+        .route(
+            "/auth/rotate-keys",
+            post({
+                let km = versioned_km.clone();
+                move || async move {
+                    let new_kid = km.rotate();
+                    Json(json!({
+                        "status": "rotated",
+                        "new_kid": new_kid,
+                        "total_keys": km.key_count(),
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/admin/circuit-breakers",
+            get({
+                let cb = cb_manager.clone();
+                move || async move {
+                    let status = cb.get_status();
+                    let entries: Vec<serde_json::Value> = status
+                        .iter()
+                        .map(|(upstream, s)| {
+                            json!({
+                                "upstream": upstream,
+                                "state": s.state.to_string(),
+                                "consecutive_failures": s.consecutive_failures,
+                                "total_requests": s.total_requests,
+                                "total_failures": s.total_failures,
+                                "total_circuit_opens": s.total_circuit_opens,
+                                "healthy": s.healthy,
+                            })
+                        })
+                        .collect();
+                    Json(json!({ "circuit_breakers": entries }))
+                }
+            }),
+        )
+        .route(
+            "/admin/keys",
+            get({
+                let km = versioned_km.clone();
+                move || async move {
+                    let info: Vec<serde_json::Value> = km
+                        .key_info()
+                        .into_iter()
+                        .map(|(kid, version, active)| {
+                            json!({
+                                "kid": kid,
+                                "version": version,
+                                "active": active,
+                            })
+                        })
+                        .collect();
+                    Json(json!({
+                        "current_kid": km.current_kid(),
+                        "total_keys": km.key_count(),
+                        "keys": info,
+                    }))
+                }
+            }),
+        )
+        .route("/ws/{*path}", any(ws_proxy_handler))
         .fallback(proxy_handler)
-        .with_state(state)
+        .with_state(state);
+
+    // Apply auth middleware if enabled
+    if auth_config.enabled {
+        app = app.layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            jwt_auth::jwt_auth_middleware,
+        ));
+    }
+
+    app = app
         .layer(middleware::from_fn(logging_middleware))
         .layer(middleware::from_fn(request_id_middleware));
+
+    // Spawn health check background task
+    if cb_enabled {
+        let cb_for_health = cb_manager.clone();
+        let interval = Duration::from_millis(cb_interval_ms);
+        tokio::spawn(async move {
+            circuit_breaker::run_health_checks(cb_for_health, interval).await;
+        });
+        info!("Circuit breaker health checks started");
+    }
 
     if tls_enabled {
         start_with_tls(app, &tls_file_config).await
@@ -180,6 +327,14 @@ async fn health_handler() -> Json<serde_json::Value> {
         "tls": "supported",
         "pqc": "X25519MLKEM768",
         "fips": ["FIPS 203 (ML-KEM)", "FIPS 204 (ML-DSA)", "FIPS 186-5 (ECDSA)"],
+        "features": {
+            "jwt_auth": "ML-DSA-65",
+            "key_rotation": "versioned JWKS",
+            "circuit_breaker": "per-upstream",
+            "body_integrity": "PQC signed",
+            "websocket": "bidirectional tunnel",
+            "threshold_signing": "Shamir SSS",
+        },
     }))
 }
 

@@ -21,6 +21,29 @@ https_port = 8443
 [signatures]
 default_mode = "hybrid"
 
+# JWT + ML-DSA-65 authentication
+[auth]
+enabled = false
+issuer = "pqc-gateway"
+audience = "pqc-gateway-api"
+token_ttl_seconds = 3600
+public_paths = ["/health", "/auth/", "/.well-known/", "/admin/"]
+
+# Circuit breaker for upstream health
+[circuit_breaker]
+enabled = true
+failure_threshold = 5
+recovery_timeout_ms = 30000
+health_check_interval_ms = 10000
+health_check_path = "/health"
+
+# Threshold key management (Shamir's Secret Sharing)
+[threshold]
+enabled = true
+threshold = 3
+total_shares = 5
+max_retained_keys = 5
+
 [[routes]]
 id = "api-service-items"
 path_prefix = "/api/v1/items"

@@ -19,3 +19,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 sha2 = "0.10"
+base64 = "0.22"
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+chrono = { workspace = true }
