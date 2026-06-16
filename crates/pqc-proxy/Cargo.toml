@@ -24,3 +24,10 @@ reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 chrono = { workspace = true }
+arc-swap = { workspace = true }
+dashmap = { workspace = true }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+tokio-rustls = "0.26"
+rustls-pki-types = "1"
+rustls-pemfile = "2"

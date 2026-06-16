@@ -21,6 +21,8 @@ uuid = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tokio-rustls = "0.26"
-rustls = { version = "0.23", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 rustls-pemfile = "2"
 chrono = { workspace = true }
+arc-swap = { workspace = true }
+dashmap = { workspace = true }

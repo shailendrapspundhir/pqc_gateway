@@ -214,10 +214,14 @@ mod tests {
             id: "ws-echo".to_string(),
             path_prefix: "/ws".to_string(),
             upstream: "http://127.0.0.1:9001".to_string(),
+            upstreams: vec!["http://127.0.0.1:9001".to_string()],
             strip_prefix: false,
             methods: vec!["GET".to_string()],
             timeout_ms: 30000,
             signature_mode: None,
+            rate_limit: None,
+            max_request_body_bytes: None,
+            upstream_tls: false,
         };
         let url = build_upstream_ws_url(&route, "/ws/echo");
         assert_eq!(url, "ws://127.0.0.1:9001/ws/echo");
@@ -229,10 +233,14 @@ mod tests {
             id: "ws-chat".to_string(),
             path_prefix: "/ws".to_string(),
             upstream: "http://127.0.0.1:9001".to_string(),
+            upstreams: vec!["http://127.0.0.1:9001".to_string()],
             strip_prefix: true,
             methods: vec!["GET".to_string()],
             timeout_ms: 30000,
             signature_mode: None,
+            rate_limit: None,
+            max_request_body_bytes: None,
+            upstream_tls: false,
         };
         let url = build_upstream_ws_url(&route, "/ws/chat/room1");
         assert_eq!(url, "ws://127.0.0.1:9001/chat/room1");

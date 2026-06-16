@@ -135,12 +135,13 @@ PIDS+=($!)
 wait_for_port 9001 "sample-api-service"
 wait_for_port 9002 "sample-test-service"
 
-# Start gateway (port 8090)
-echo -e "${YELLOW}Starting pqc-gateway on :8090...${NC}"
-cargo run --bin pqc-gateway -- --config config/gateway.toml &>/dev/null &
+# Start gateway (port 8090 public, port 9090 admin)
+echo -e "${YELLOW}Starting pqc-gateway on :8090 (admin :9090)...${NC}"
+GATEWAY_ADMIN_API_KEY=test-api-key cargo run --bin pqc-gateway -- --config config/gateway.toml &>/dev/null &
 PIDS+=($!)
 
 wait_for_port 8090 "pqc-gateway"
+wait_for_port 9090 "pqc-gateway admin"
 echo ""
 
 # ------------------------------------------------------------------

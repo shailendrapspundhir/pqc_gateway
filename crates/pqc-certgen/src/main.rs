@@ -73,6 +73,9 @@ enum Commands {
 
     /// Demonstrate PQC signature modes (hybrid + ML-DSA-only).
     SignatureDemo,
+
+    /// Generate a signing key seed and print it as hex (for GATEWAY_SIGNING_KEY env var).
+    Keygen,
 }
 
 fn main() -> Result<()> {
@@ -175,9 +178,38 @@ fn main() -> Result<()> {
         Commands::SignatureDemo => {
             run_signature_demo()?;
         }
+
+        Commands::Keygen => {
+            run_keygen();
+        }
     }
 
     Ok(())
+}
+
+fn run_keygen() {
+    use pqc_tls::signature::SignatureKeyManager;
+
+    let km = SignatureKeyManager::generate();
+    let hex = km.seed_hex();
+    println!("=== PQC Gateway Signing Key ===");
+    println!();
+    println!("ML-DSA-65 seed (hex):  {hex}");
+    println!("Fingerprint:           {}", km.fingerprint());
+    println!();
+    println!("Set this as an environment variable:");
+    println!("  export GATEWAY_SIGNING_KEY={hex}");
+    println!();
+    println!("Or pass it at startup:");
+    println!("  GATEWAY_SIGNING_KEY={hex} cargo run --bin pqc-gateway -- --config config/gateway.toml");
+
+    // Verify round-trip
+    let km2 = SignatureKeyManager::from_seed_hex(&hex).expect("seed round-trip failed");
+    let test_data = b"keygen verification test";
+    let sig_out = km2.sign(pqc_tls::signature::SignatureMode::MlDsaOnly, test_data).unwrap();
+    assert!(km2.verify(test_data, &sig_out), "Signature verification failed");
+    println!();
+    println!("Key verified: sign + verify OK");
 }
 
 fn run_pqc_demo() -> Result<()> {

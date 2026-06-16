@@ -129,6 +129,54 @@ struct Inner {
 }
 
 impl SignatureKeyManager {
+    /// Create from a hex-encoded seed (read from env var).
+    /// The seed is used for ML-DSA; ECDSA is generated fresh.
+    pub fn from_seed_hex(hex: &str) -> Result<Self, String> {
+        let seed_bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&hex[i..i + 2], 16)
+                    .map_err(|e| format!("invalid hex: {e}"))
+            })
+            .collect::<Result<Vec<u8>, _>>()?;
+
+        let ecdsa_signing_key = EcdsaSigningKey::random(&mut rand_core::OsRng);
+        let ecdsa_verifying_key = EcdsaVerifyingKey::from(&ecdsa_signing_key);
+
+        // Derive ML-DSA keypair from seed
+        let seed_arr = ml_dsa::Seed::try_from(seed_bytes.as_slice())
+            .map_err(|_| "Invalid ML-DSA-65 seed length (expected 32 bytes)".to_string())?;
+        use ml_dsa::signature::Keypair as _;
+        let sk = ml_dsa::SigningKey::<ml_dsa::MlDsa65>::from_seed(&seed_arr);
+        let vk = sk.verifying_key();
+        let mldsa_public_key = vk.encode().to_vec();
+
+        let fingerprint = combined_fingerprint(
+            &ecdsa_verifying_key.to_encoded_point(false).as_bytes().to_vec(),
+            &mldsa_public_key,
+        );
+
+        info!(
+            fingerprint = %fingerprint,
+            "Signature key manager initialised from env seed"
+        );
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                ecdsa_signing_key,
+                ecdsa_verifying_key,
+                mldsa_seed: seed_bytes,
+                mldsa_public_key,
+                fingerprint,
+            }),
+        })
+    }
+
+    /// Export the ML-DSA seed as hex (for keygen CLI).
+    pub fn seed_hex(&self) -> String {
+        self.inner.mldsa_seed.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     /// Generate fresh ECDSA-P256 + ML-DSA-65 key pairs.
     pub fn generate() -> Self {
         let ecdsa_signing_key = EcdsaSigningKey::random(&mut rand_core::OsRng);

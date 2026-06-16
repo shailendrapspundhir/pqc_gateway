@@ -1,6 +1,6 @@
 use anyhow::Result;
 use axum::middleware;
-use axum::response::Json;
+use axum::response::{IntoResponse, Json};
 use axum::routing::{any, get, post};
 use axum::Router;
 use clap::Parser;
@@ -16,8 +16,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "pqc-gateway", about = "PQC-enabled API Gateway with TLS 1.3 + PQC support")]
@@ -37,26 +38,36 @@ async fn main() -> Result<()> {
     // Initialize tracing
     init_tracing(&config.logging.level, &config.logging.format);
 
-    // Log signature mode from env and config
+    // Log startup info
     let env_sig_mode = std::env::var("PQC_SIGNATURE_MODE").ok();
+    let has_signing_key = std::env::var("GATEWAY_SIGNING_KEY").is_ok();
     info!(
         version = env!("CARGO_PKG_VERSION"),
         config = %cli.config.display(),
         env_signature_mode = ?env_sig_mode,
+        signing_key_from_env = has_signing_key,
         config_default_signature_mode = %config.signatures.default_mode,
         auth_enabled = config.auth.enabled,
         cb_enabled = config.circuit_breaker.enabled,
         threshold_enabled = config.threshold.enabled,
+        rate_limit_enabled = config.rate_limit.enabled,
+        admin_enabled = config.admin.enabled,
         "Starting PQC Gateway"
     );
 
-    // Build proxy state and router
+    // Install rustls crypto provider (needed for HTTPS upstream connector)
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // Build proxy state
     let tls_enabled = config.tls.enabled;
     let tls_file_config = config.tls.clone();
     let http_port = config.server.http_port;
+    let drain_timeout = config.server.drain_timeout_seconds;
     let auth_config = config.auth.clone();
+    let admin_config = config.admin.clone();
     let cb_enabled = config.circuit_breaker.enabled;
     let cb_interval_ms = config.circuit_breaker.health_check_interval_ms;
+    let metrics_enabled = config.metrics.enabled;
     let state = ProxyState::new(config);
 
     // Set up auth state
@@ -67,13 +78,15 @@ async fn main() -> Result<()> {
         public_paths: auth_config.public_paths.clone(),
     });
 
-    // Clone for handlers
     let versioned_km = state.versioned_key_manager.clone();
-    let cb_manager = state.circuit_breaker.clone();
-    let auth_state_for_token = auth_state.clone();
+    let metrics = state.metrics.clone();
 
+    // ---- Build public proxy router (NO admin/auth endpoints) ----
     let mut app = Router::new()
-        .route("/health", get(health_handler))
+        .route("/health", get({
+            let m = metrics.clone();
+            move || async move { health_handler(m.is_ready()).await }
+        }))
         .route(
             "/.well-known/jwks.json",
             get({
@@ -81,55 +94,111 @@ async fn main() -> Result<()> {
                 move || async move { Json(km.jwks()) }
             }),
         )
-        .route(
-            "/auth/token",
-            post({
-                let auth = auth_state_for_token.clone();
-                move |body: Json<serde_json::Value>| async move {
-                    let sub = body.get("sub").and_then(|v| v.as_str()).unwrap_or("anonymous");
-                    let roles: Vec<String> = body
-                        .get("roles")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    match jwt_auth::create_jwt(
-                        &auth.key_manager,
-                        sub,
-                        &roles,
-                        &auth.issuer,
-                        &auth.audience,
-                        3600,
-                    ) {
-                        Some(token) => Json(json!({
-                            "token": token,
-                            "token_type": "Bearer",
-                            "expires_in": 3600,
-                            "algorithm": "ML-DSA-65",
-                            "kid": auth.key_manager.current_kid(),
-                        })),
-                        None => Json(json!({ "error": "token generation failed" })),
-                    }
+        .route("/ws/{*path}", any(ws_proxy_handler))
+        .fallback(proxy_handler)
+        .with_state(state.clone());
+
+    // Readiness probe
+    app = app.route("/ready", get({
+        let m = metrics.clone();
+        move || async move { readiness_handler(m.is_ready()).await }
+    }));
+
+    // Metrics endpoint on the public router (if enabled, read-only)
+    if metrics_enabled {
+        app = app.route("/metrics", get({
+            let m = metrics.clone();
+            move || async move {
+                let body = m.render_prometheus();
+                (
+                    [(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    body,
+                )
+            }
+        }));
+    }
+
+    // Apply auth middleware if enabled
+    if auth_config.enabled {
+        app = app.layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            jwt_auth::jwt_auth_middleware,
+        ));
+    }
+
+    app = app
+        .layer(middleware::from_fn(logging_middleware))
+        .layer(middleware::from_fn(request_id_middleware));
+
+    // ---- Build admin router (separate listener, API-key protected) ----
+    let admin_api_key = admin_config.effective_api_key();
+    if admin_config.enabled {
+        let admin_app = build_admin_router(
+            state.clone(),
+            auth_state.clone(),
+            admin_api_key.clone(),
+        );
+        let admin_bind = format!("{}:{}", admin_config.bind_address, admin_config.port);
+        tokio::spawn(async move {
+            match TcpListener::bind(&admin_bind).await {
+                Ok(listener) => {
+                    info!(address = %admin_bind, "Admin listener started");
+                    let _ = axum::serve(listener, admin_app)
+                        .with_graceful_shutdown(shutdown_signal())
+                        .await;
                 }
-            }),
-        )
-        .route(
-            "/auth/rotate-keys",
-            post({
-                let km = versioned_km.clone();
-                move || async move {
-                    let new_kid = km.rotate();
-                    Json(json!({
-                        "status": "rotated",
-                        "new_kid": new_kid,
-                        "total_keys": km.key_count(),
-                    }))
+                Err(e) => {
+                    error!(error = %e, address = %admin_bind, "Failed to start admin listener");
                 }
-            }),
-        )
+            }
+        });
+    }
+
+    // Spawn health check background task
+    if cb_enabled {
+        let cb_for_health = state.circuit_breaker.clone();
+        let interval = Duration::from_millis(cb_interval_ms);
+        tokio::spawn(async move {
+            circuit_breaker::run_health_checks(cb_for_health, interval).await;
+        });
+        info!("Circuit breaker health checks started");
+    }
+
+    // Spawn rate limiter cleanup task
+    {
+        let rl = state.rate_limiter.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                rl.cleanup(Duration::from_secs(600));
+            }
+        });
+    }
+
+    if tls_enabled {
+        start_with_tls(app, &tls_file_config, drain_timeout).await
+    } else {
+        start_plain(app, http_port).await
+    }
+}
+
+/// Build the admin-only router with API key middleware.
+fn build_admin_router(
+    state: ProxyState,
+    auth_state: Arc<AuthState>,
+    api_key: Option<String>,
+) -> Router {
+    let versioned_km = state.versioned_key_manager.clone();
+    let cb_manager = state.circuit_breaker.clone();
+    let proxy_state = state.clone();
+    let metrics = state.metrics.clone();
+    let auth_for_token = auth_state.clone();
+
+    let mut admin = Router::new()
+        .route("/admin/health", get({
+            let m = metrics.clone();
+            move || async move { health_handler(m.is_ready()).await }
+        }))
         .route(
             "/admin/circuit-breakers",
             get({
@@ -178,45 +247,174 @@ async fn main() -> Result<()> {
                 }
             }),
         )
-        .route("/ws/{*path}", any(ws_proxy_handler))
-        .fallback(proxy_handler)
-        .with_state(state);
+        .route(
+            "/admin/metrics",
+            get({
+                let m = metrics.clone();
+                move || async move { Json(m.to_json()) }
+            }),
+        )
+        .route(
+            "/admin/config",
+            get({
+                let ps = proxy_state.clone();
+                move || async move {
+                    let cfg = ps.config.load();
+                    Json(json!({
+                        "routes": cfg.routes.len(),
+                        "rate_limit_enabled": cfg.rate_limit.enabled,
+                        "circuit_breaker_enabled": cfg.circuit_breaker.enabled,
+                        "auth_enabled": cfg.auth.enabled,
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/admin/config/reload",
+            post({
+                let ps = proxy_state.clone();
+                move |body: Json<serde_json::Value>| async move {
+                    let json_str = serde_json::to_string(&*body).unwrap_or_default();
+                    match GatewayConfig::from_json(&json_str) {
+                        Ok(new_config) => {
+                            let route_count = new_config.routes.len();
+                            ps.reload_config(new_config);
+                            Json(json!({
+                                "status": "reloaded",
+                                "routes": route_count,
+                            }))
+                        }
+                        Err(e) => {
+                            Json(json!({
+                                "status": "error",
+                                "error": e.to_string(),
+                            }))
+                        }
+                    }
+                }
+            }),
+        )
+        .route(
+            "/admin/routes",
+            get({
+                let ps = proxy_state.clone();
+                move || async move {
+                    let cfg = ps.config.load();
+                    Json(json!({ "routes": cfg.routes }))
+                }
+            }),
+        )
+        .route(
+            "/admin/routes/update",
+            post({
+                let ps = proxy_state.clone();
+                move |body: Json<serde_json::Value>| async move {
+                    // Accept {"routes": [...]} to update just routes
+                    if let Some(routes_val) = body.get("routes") {
+                        let routes_str = serde_json::to_string(routes_val).unwrap_or_default();
+                        match serde_json::from_str::<Vec<pqc_proxy::config::RouteConfig>>(&routes_str) {
+                            Ok(new_routes) => {
+                                if new_routes.is_empty() {
+                                    return Json(json!({"status": "error", "error": "empty routes"}));
+                                }
+                                let mut cfg: GatewayConfig = (*ps.config.load_full()).clone();
+                                cfg.routes = new_routes;
+                                let count = cfg.routes.len();
+                                ps.reload_config(cfg);
+                                Json(json!({"status": "updated", "routes": count}))
+                            }
+                            Err(e) => Json(json!({"status": "error", "error": e.to_string()})),
+                        }
+                    } else {
+                        Json(json!({"status": "error", "error": "missing 'routes' field"}))
+                    }
+                }
+            }),
+        )
+        // Auth token issuance + key rotation on admin listener
+        .route(
+            "/auth/token",
+            post({
+                let auth = auth_for_token.clone();
+                move |body: Json<serde_json::Value>| async move {
+                    let sub = body.get("sub").and_then(|v| v.as_str()).unwrap_or("anonymous");
+                    let roles: Vec<String> = body
+                        .get("roles")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    match jwt_auth::create_jwt(
+                        &auth.key_manager, sub, &roles,
+                        &auth.issuer, &auth.audience, 3600,
+                    ) {
+                        Some(token) => Json(json!({
+                            "token": token,
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                            "algorithm": "ML-DSA-65",
+                            "kid": auth.key_manager.current_kid(),
+                        })),
+                        None => Json(json!({ "error": "token generation failed" })),
+                    }
+                }
+            }),
+        )
+        .route(
+            "/auth/rotate-keys",
+            post({
+                let km = versioned_km.clone();
+                move || async move {
+                    let new_kid = km.rotate();
+                    Json(json!({
+                        "status": "rotated",
+                        "new_kid": new_kid,
+                        "total_keys": km.key_count(),
+                    }))
+                }
+            }),
+        );
 
-    // Apply auth middleware if enabled
-    if auth_config.enabled {
-        app = app.layer(axum::middleware::from_fn_with_state(
-            auth_state.clone(),
-            jwt_auth::jwt_auth_middleware,
-        ));
+    // Apply API key middleware if configured
+    if let Some(key) = api_key {
+        admin = admin.layer(middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let expected = key.clone();
+            async move {
+                // Allow health checks without auth
+                let path = req.uri().path().to_string();
+                if path == "/admin/health" {
+                    return next.run(req).await;
+                }
+
+                let provided = req.headers()
+                    .get("x-api-key")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+
+                if provided == expected {
+                    next.run(req).await
+                } else {
+                    warn!(path = %path, "Admin API key validation failed");
+                    pqc_proxy::error::GatewayError::Unauthorized(
+                        "invalid or missing API key".to_string()
+                    ).into_response()
+                }
+            }
+        }));
     }
 
-    app = app
-        .layer(middleware::from_fn(logging_middleware))
-        .layer(middleware::from_fn(request_id_middleware));
-
-    // Spawn health check background task
-    if cb_enabled {
-        let cb_for_health = cb_manager.clone();
-        let interval = Duration::from_millis(cb_interval_ms);
-        tokio::spawn(async move {
-            circuit_breaker::run_health_checks(cb_for_health, interval).await;
-        });
-        info!("Circuit breaker health checks started");
-    }
-
-    if tls_enabled {
-        start_with_tls(app, &tls_file_config).await
-    } else {
-        start_plain(app, http_port).await
-    }
+    admin
 }
 
-/// Start the gateway with TLS (HTTPS) + optional plain HTTP redirect.
+/// Start the gateway with TLS (HTTPS) + graceful drain.
 async fn start_with_tls(
     app: Router,
     tls_file_config: &pqc_proxy::config::TlsFileConfig,
+    drain_timeout: u64,
 ) -> Result<()> {
-    // Convert file-level config to pqc-tls config
     let tls_config = TlsConfig {
         enabled: true,
         cert_file: tls_file_config.cert_file.clone(),
@@ -228,10 +426,8 @@ async fn start_with_tls(
         signatures: Default::default(),
     };
 
-    // Run FIPS compliance checks at startup
     fips::log_compliance_report(tls_config.pqc_enabled);
 
-    // Build rustls server config
     let rustls_config = pqc_tls::provider::build_server_config(&tls_config)?;
     let acceptor = TlsAcceptor::from(Arc::new(rustls_config));
 
@@ -245,10 +441,14 @@ async fn start_with_tls(
         "Gateway listening (HTTPS with TLS 1.3 + PQC)"
     );
 
-    // Accept TLS connections in a loop
     let app = Arc::new(app);
+    // Use a watch channel to signal graceful shutdown to all connections
+    let (shutdown_tx, _) = watch::channel(false);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+
+    // Track in-flight connections for graceful drain
+    let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     loop {
         tokio::select! {
@@ -256,11 +456,13 @@ async fn start_with_tls(
                 let (stream, peer_addr) = result?;
                 let acceptor = acceptor.clone();
                 let app = app.clone();
+                let mut shutdown_rx = shutdown_tx.subscribe();
+                let conn_count = connection_count.clone();
+                conn_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 tokio::spawn(async move {
                     match acceptor.accept(stream).await {
                         Ok(tls_stream) => {
-                            // Log negotiated parameters
                             let (_, server_conn) = tls_stream.get_ref();
                             if let Some(neg_info) = pqc_tls::provider::NegotiatedInfo::from_server_connection(server_conn) {
                                 info!(
@@ -272,33 +474,57 @@ async fn start_with_tls(
                                 );
                             }
 
-                            // Serve HTTP over TLS
                             let io = hyper_util::rt::TokioIo::new(tls_stream);
                             let service = hyper_util::service::TowerToHyperService::new((*app).clone());
-                            if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                            let builder = hyper_util::server::conn::auto::Builder::new(
                                 hyper_util::rt::TokioExecutor::new(),
-                            )
-                            .serve_connection(io, service)
-                            .await
-                            {
-                                // Connection reset by peer is normal
-                                if !e.to_string().contains("connection reset") {
-                                    error!(peer = %peer_addr, error = %e, "Connection error");
+                            );
+                            let conn = builder.serve_connection(io, service);
+                            tokio::pin!(conn);
+
+                            // Graceful drain: wait for either connection completion or shutdown
+                            loop {
+                                tokio::select! {
+                                    result = conn.as_mut() => {
+                                        if let Err(e) = result {
+                                            if !e.to_string().contains("connection reset") {
+                                                error!(peer = %peer_addr, error = %e, "Connection error");
+                                            }
+                                        }
+                                        break;
+                                    }
+                                    _ = shutdown_rx.changed() => {
+                                        info!(peer = %peer_addr, "Draining TLS connection...");
+                                        conn.as_mut().graceful_shutdown();
+                                        // Continue polling until the connection finishes
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
-                            // TLS handshake failures are common (port scanners, wrong TLS version)
                             info!(peer = %peer_addr, error = %e, "TLS handshake failed");
                         }
                     }
+                    conn_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 });
             }
             _ = &mut shutdown => {
-                info!("Shutting down TLS server...");
+                info!("Shutting down TLS server — draining connections...");
+                let _ = shutdown_tx.send(true);
                 break;
             }
         }
+    }
+
+    // Wait for in-flight connections to drain (with timeout)
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(drain_timeout);
+    while connection_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        if tokio::time::Instant::now() > drain_deadline {
+            let remaining = connection_count.load(std::sync::atomic::Ordering::Relaxed);
+            warn!(remaining = remaining, "Drain timeout — forcing shutdown");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     info!("Gateway shut down");
@@ -319,9 +545,9 @@ async fn start_plain(app: Router, http_port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn health_handler() -> Json<serde_json::Value> {
+async fn health_handler(ready: bool) -> Json<serde_json::Value> {
     Json(json!({
-        "status": "healthy",
+        "status": if ready { "healthy" } else { "degraded" },
         "service": "pqc-gateway",
         "version": env!("CARGO_PKG_VERSION"),
         "tls": "supported",
@@ -334,8 +560,22 @@ async fn health_handler() -> Json<serde_json::Value> {
             "body_integrity": "PQC signed",
             "websocket": "bidirectional tunnel",
             "threshold_signing": "Shamir SSS",
+            "rate_limiting": "token-bucket",
+            "hot_reload": "JSON API",
+            "admin_listener": "separate port",
+            "https_upstream": "TLS client",
+            "load_balancing": "round-robin",
+            "prometheus_metrics": "text exposition",
         },
     }))
+}
+
+async fn readiness_handler(ready: bool) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    if ready {
+        (axum::http::StatusCode::OK, Json(json!({"ready": true})))
+    } else {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"ready": false})))
+    }
 }
 
 async fn shutdown_signal() {
